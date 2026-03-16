@@ -1,0 +1,16 @@
+# Pipecat with all required service extras:
+#   silero    – on-device VAD (SileroVADAnalyzer)
+#   deepgram  – speech-to-text
+#   openai    – LLM (GPT-4.1-mini)
+#   elevenlabs – text-to-speech
+#   websocket – WebsocketServerTransport + websockets library
+pipecat-ai[silero,deepgram,openai,elevenlabs,websocket]
+
+# ASGI server — runs FastAPI (handles both HTTP and WebSocket on one port)
+uvicorn
+
+# Async HTTP client used by PlivoFrameSerializer for auto hang-up
+aiohttp
+
+# .env loading
+python-dotenv

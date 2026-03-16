@@ -1,0 +1,2 @@
+pipecat-ai[silero,deepgram,openai,elevenlabs,local]
+python-dotenv
