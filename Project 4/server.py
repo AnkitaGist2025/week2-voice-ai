@@ -37,6 +37,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    TextFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -259,6 +260,13 @@ async def websocket_endpoint(websocket: WebSocket):
         params=PipelineParams(allow_interruptions=True),
         idle_timeout_secs=300,
     )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, websocket):
+        logger.info("[Plivo] WebSocket connected — queuing greeting")
+        await task.queue_frames([
+            TextFrame("Hello! I'm your phone assistant. How can I help you today?")
+        ])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, websocket):
