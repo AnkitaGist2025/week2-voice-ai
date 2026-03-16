@@ -53,7 +53,6 @@ from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
-from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -284,15 +283,12 @@ async def websocket_endpoint(websocket: WebSocket):
     tts = DiagnosticElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
         sample_rate=16000,
-        # auto_mode=False lets ElevenLabs stream tokens as they arrive instead of
-        # waiting to optimise latency server-side — critical on Railway where
-        # round-trip latency to ElevenLabs is higher than local.
-        auto_mode=False,
-        # TOKEN aggregation sends each LLM token to TTS immediately; the default
-        # SENTENCE mode buffers a full sentence first (~200-300 ms extra).
-        text_aggregation_mode=TextAggregationMode.TOKEN,
-        # 10-second window before TTSStoppedFrame fires without audio.
-        # Default is 2 s; Railway → ElevenLabs TTFB can exceed that.
+        # auto_mode=True (default): ElevenLabs streams audio as soon as it has
+        # enough text — no explicit flush needed.  auto_mode=False requires
+        # pipecat to send {"flush":True} which only happens after playback, creating
+        # a deadlock where ElevenLabs waits for flush and pipecat waits for audio.
+        # stop_frame_timeout_s raised from 2 s to 10 s to survive Railway → ElevenLabs
+        # round-trip latency on the first connection.
         stop_frame_timeout_s=10.0,
         settings=ElevenLabsTTSSettings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
