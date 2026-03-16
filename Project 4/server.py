@@ -25,6 +25,7 @@ Run
 
 import json
 import os
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -64,7 +65,8 @@ async def answer():
     appending /ws — so both HTTP and WS share the same ngrok tunnel.
     """
     server_url = os.getenv("SERVER_URL", "").rstrip("/")
-    ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
+    host = urlparse(server_url).netloc or server_url
+    ws_url = f"wss://{host}/ws"
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
