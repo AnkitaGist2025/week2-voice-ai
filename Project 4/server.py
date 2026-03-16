@@ -49,7 +49,12 @@ load_dotenv()
 app = FastAPI()
 
 
-# ── HTTP endpoint ─────────────────────────────────────────────────────────────
+# ── HTTP endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 
 @app.api_route("/answer", methods=["GET", "POST"])
 async def answer():
