@@ -218,9 +218,6 @@ async def websocket_endpoint(websocket: WebSocket):
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            # Must match ElevenLabs sample_rate below so the serializer
-            # receives frames labelled at the correct rate before resampling to 8kHz.
-            audio_out_sample_rate=16000,
             # SileroVAD runs on-device to detect end-of-speech before sending to STT
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
@@ -243,9 +240,6 @@ async def websocket_endpoint(websocket: WebSocket):
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
         voice_id=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
-        # pcm_16000: raw PCM at 16kHz — clean 2:1 downsample to Plivo's 8kHz μ-law.
-        # Avoids the ambiguous default (24kHz) that can cause silent resampling failures.
-        sample_rate=16000,
     )
 
     messages = [
