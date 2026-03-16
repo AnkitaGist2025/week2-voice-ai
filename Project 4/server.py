@@ -53,6 +53,7 @@ from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
+from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -262,10 +263,12 @@ async def websocket_endpoint(websocket: WebSocket):
             # SileroVAD runs on-device to detect end-of-speech before sending to STT
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    confidence=0.7,
-                    start_secs=0.2,
+                    # Raised confidence + min_volume to ignore Plivo codec noise
+                    # at stream start, which was triggering false interruptions.
+                    confidence=0.85,
+                    start_secs=0.4,   # must hear speech for 400ms before triggering
                     stop_secs=0.8,
-                    min_volume=0.4,
+                    min_volume=0.6,
                 )
             ),
         ),
@@ -281,6 +284,16 @@ async def websocket_endpoint(websocket: WebSocket):
     tts = DiagnosticElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
         sample_rate=16000,
+        # auto_mode=False lets ElevenLabs stream tokens as they arrive instead of
+        # waiting to optimise latency server-side — critical on Railway where
+        # round-trip latency to ElevenLabs is higher than local.
+        auto_mode=False,
+        # TOKEN aggregation sends each LLM token to TTS immediately; the default
+        # SENTENCE mode buffers a full sentence first (~200-300 ms extra).
+        text_aggregation_mode=TextAggregationMode.TOKEN,
+        # 10-second window before TTSStoppedFrame fires without audio.
+        # Default is 2 s; Railway → ElevenLabs TTFB can exceed that.
+        stop_frame_timeout_s=10.0,
         settings=ElevenLabsTTSSettings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
             model="eleven_turbo_v2",
