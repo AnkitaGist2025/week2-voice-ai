@@ -34,11 +34,20 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import (
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
@@ -124,6 +133,56 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
         return await super().deserialize(data)
 
 
+# ── Audio debug logger ────────────────────────────────────────────────────────
+
+class AudioDebugLogger(FrameProcessor):
+    """Logs key pipeline events to help debug audio flow.
+
+    Placement: between tts and transport.output() so it observes both
+    TTS-produced audio frames (flowing from tts) and upstream frames
+    (STT transcriptions, LLM events) that travel the full pipeline length.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._tts_chunks = 0
+        self._tts_bytes = 0
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            logger.info(f"[STT ] transcript: '{frame.text}'")
+
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            logger.info("[LLM ] response started")
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            logger.info("[LLM ] response ended")
+
+        elif isinstance(frame, TTSStartedFrame):
+            self._tts_chunks = 0
+            self._tts_bytes = 0
+            logger.info("[TTS ] synthesis started")
+
+        elif isinstance(frame, TTSAudioRawFrame):
+            self._tts_chunks += 1
+            self._tts_bytes += len(frame.audio)
+            if self._tts_chunks == 1:
+                logger.info(
+                    f"[TTS ] first audio chunk — {len(frame.audio)} bytes "
+                    f"@ {frame.sample_rate}Hz"
+                )
+
+        elif isinstance(frame, TTSStoppedFrame):
+            logger.info(
+                f"[TTS ] synthesis done — {self._tts_chunks} chunks, "
+                f"{self._tts_bytes} bytes total sent to transport"
+            )
+
+        await self.push_frame(frame, direction)
+
+
 # ── WebSocket endpoint + Pipecat pipeline ────────────────────────────────────
 
 @app.websocket("/ws")
@@ -189,6 +248,7 @@ async def websocket_endpoint(websocket: WebSocket):
             context_aggregator.user(),  # accumulates user turn, fires when turn ends
             llm,                        # GPT-4.1-mini: text → text response
             tts,                        # ElevenLabs: text → audio frames
+            AudioDebugLogger(),         # logs STT/LLM/TTS events for debugging
             transport.output(),         # μ-law-encodes audio, sends back to Plivo
             context_aggregator.assistant(),
         ]
