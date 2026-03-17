@@ -52,7 +52,10 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
+from pipecat.services.elevenlabs.tts import (
+    ElevenLabsHttpTTSService,
+    ElevenLabsHttpTTSSettings,
+)
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -199,45 +202,7 @@ class AudioDebugLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# ── Diagnostic ElevenLabs TTS service ────────────────────────────────────────
-
-class _LoggingWebSocket:
-    """Proxy that logs non-audio messages from ElevenLabs (e.g. API errors)."""
-
-    def __init__(self, ws):
-        self._ws = ws
-
-    def __getattr__(self, name):
-        return getattr(self._ws, name)
-
-    def __aiter__(self):
-        return self._iterate()
-
-    async def _iterate(self):
-        async for message in self._ws:
-            try:
-                msg = json.loads(message)
-                if not msg.get("audio") and not msg.get("alignment") and msg.get("isFinal") is not True:
-                    logger.warning(f"[TTS ] ElevenLabs non-audio message: {msg}")
-            except Exception:
-                pass
-            yield message
-
-
-class DiagnosticElevenLabsTTSService(ElevenLabsTTSService):
-    """ElevenLabsTTSService with extra logging for Railway debugging."""
-
-    async def _connect_websocket(self):
-        logger.info(
-            f"[TTS ] Connecting to ElevenLabs — "
-            f"voice={self._settings.voice!r} "
-            f"model={self._settings.model!r} "
-            f"sample_rate={self.sample_rate}Hz"
-        )
-        await super()._connect_websocket()
-        if self._websocket:
-            self._websocket = _LoggingWebSocket(self._websocket)
-            logger.info("[TTS ] ElevenLabs WebSocket wrapped for diagnostics")
+# (ElevenLabsHttpTTSService is used directly — no subclass needed)
 
 
 # ── WebSocket endpoint + Pipecat pipeline ────────────────────────────────────
@@ -280,17 +245,10 @@ async def websocket_endpoint(websocket: WebSocket):
         model="gpt-4.1-mini",
     )
 
-    tts = DiagnosticElevenLabsTTSService(
+    tts = ElevenLabsHttpTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY"),
         sample_rate=16000,
-        # auto_mode=True (default): ElevenLabs streams audio as soon as it has
-        # enough text — no explicit flush needed.  auto_mode=False requires
-        # pipecat to send {"flush":True} which only happens after playback, creating
-        # a deadlock where ElevenLabs waits for flush and pipecat waits for audio.
-        # stop_frame_timeout_s raised from 2 s to 10 s to survive Railway → ElevenLabs
-        # round-trip latency on the first connection.
-        stop_frame_timeout_s=10.0,
-        settings=ElevenLabsTTSSettings(
+        settings=ElevenLabsHttpTTSSettings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
             model="eleven_turbo_v2",
         ),
