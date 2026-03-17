@@ -52,10 +52,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.elevenlabs.tts import (
-    ElevenLabsHttpTTSService,
-    ElevenLabsHttpTTSSettings,
-)
+from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -202,7 +199,6 @@ class AudioDebugLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# (ElevenLabsHttpTTSService is used directly — no subclass needed)
 
 
 # ── WebSocket endpoint + Pipecat pipeline ────────────────────────────────────
@@ -245,13 +241,9 @@ async def websocket_endpoint(websocket: WebSocket):
         model="gpt-4.1-mini",
     )
 
-    tts = ElevenLabsHttpTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        sample_rate=16000,
-        settings=ElevenLabsHttpTTSSettings(
-            voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
-            model="eleven_turbo_v2",
-        ),
+    tts = OpenAITTSService(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        voice="alloy",
     )
 
     messages = [
