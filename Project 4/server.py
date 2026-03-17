@@ -54,8 +54,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
-from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService, ElevenLabsHttpTTSSettings
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -257,23 +256,13 @@ async def websocket_endpoint(websocket: WebSocket):
         model="gpt-4.1-mini",
     )
 
-    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
-    if elevenlabs_key:
-        logger.info("[TTS ] Using ElevenLabs TTS")
-        tts = ElevenLabsTTSService(
-            api_key=elevenlabs_key,
-            settings=ElevenLabsTTSSettings(
-                voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
-                model="eleven_turbo_v2_5",
-            ),
-        )
-    else:
-        logger.info("[TTS ] Using OpenAI TTS (no ELEVENLABS_API_KEY set)")
-        tts = OpenAITTSService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model="tts-1",   # tts-1 has lower latency than tts-1-hd
-            voice="nova",    # nova sounds more natural/conversational than alloy
-        )
+    tts = ElevenLabsHttpTTSService(
+        api_key=os.getenv("ELEVENLABS_API_KEY"),
+        settings=ElevenLabsHttpTTSSettings(
+            voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
+            model="eleven_turbo_v2_5",
+        ),
+    )
 
     messages = [
         {
