@@ -29,6 +29,8 @@ import json
 import os
 from urllib.parse import urlparse
 
+import aiohttp
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import Response
@@ -228,88 +230,90 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info(f"[Plivo] WebSocket connected from {websocket.client}")
 
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            serializer=DynamicPlivoSerializer(),
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            add_wav_header=False,
-            # SileroVAD runs on-device to detect end-of-speech before sending to STT
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(
-                    # Raised confidence + min_volume to ignore Plivo codec noise
-                    # at stream start, which was triggering false interruptions.
-                    confidence=0.85,
-                    start_secs=0.4,   # must hear speech for 400ms before triggering
-                    stop_secs=0.8,
-                    min_volume=0.6,
-                )
+    async with aiohttp.ClientSession() as aiohttp_session:
+        transport = FastAPIWebsocketTransport(
+            websocket=websocket,
+            params=FastAPIWebsocketParams(
+                serializer=DynamicPlivoSerializer(),
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                add_wav_header=False,
+                # SileroVAD runs on-device to detect end-of-speech before sending to STT
+                vad_analyzer=SileroVADAnalyzer(
+                    params=VADParams(
+                        # Raised confidence + min_volume to ignore Plivo codec noise
+                        # at stream start, which was triggering false interruptions.
+                        confidence=0.85,
+                        start_secs=0.4,   # must hear speech for 400ms before triggering
+                        stop_secs=0.8,
+                        min_volume=0.6,
+                    )
+                ),
             ),
-        ),
-    )
+        )
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    llm = OpenAILLMService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4.1-mini",
-    )
+        llm = OpenAILLMService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            model="gpt-4.1-mini",
+        )
 
-    tts = ElevenLabsHttpTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        settings=ElevenLabsHttpTTSSettings(
-            voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
-            model="eleven_turbo_v2_5",
-        ),
-    )
-
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a friendly phone assistant. "
-                "Keep every reply to 1 sentence max — your words are spoken aloud. "
-                "Be direct and conversational. "
-                "Never use markdown, bullet points, numbers, or special characters."
+        tts = ElevenLabsHttpTTSService(
+            api_key=os.getenv("ELEVENLABS_API_KEY"),
+            aiohttp_session=aiohttp_session,
+            settings=ElevenLabsHttpTTSSettings(
+                voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
+                model="eleven_turbo_v2_5",
             ),
-        }
-    ]
+        )
 
-    context = OpenAILLMContext(messages=messages)
-    context_aggregator = LLMContextAggregatorPair(context)
-
-    # Pipeline: audio in → speech-to-text → LLM → text-to-speech → audio out
-    pipeline = Pipeline(
-        [
-            transport.input(),          # receives μ-law audio from Plivo, runs VAD
-            stt,                        # Deepgram: audio → transcript
-            context_aggregator.user(),  # accumulates user turn, fires when turn ends
-            llm,                        # GPT-4.1-mini: text → text response
-            tts,                        # ElevenLabs: text → audio frames
-            AudioDebugLogger(),         # logs STT/LLM/TTS events for debugging
-            transport.output(),         # μ-law-encodes audio, sends back to Plivo
-            context_aggregator.assistant(),
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a friendly phone assistant. "
+                    "Keep every reply to 1 sentence max — your words are spoken aloud. "
+                    "Be direct and conversational. "
+                    "Never use markdown, bullet points, numbers, or special characters."
+                ),
+            }
         ]
-    )
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(allow_interruptions=True),
-        idle_timeout_secs=300,
-    )
+        context = OpenAILLMContext(messages=messages)
+        context_aggregator = LLMContextAggregatorPair(context)
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, websocket):
-        logger.info("[Plivo] WebSocket connected — queuing greeting")
-        await task.queue_frames([
-            TextFrame("Hello! I'm your phone assistant. How can I help you today?")
-        ])
+        # Pipeline: audio in → speech-to-text → LLM → text-to-speech → audio out
+        pipeline = Pipeline(
+            [
+                transport.input(),          # receives μ-law audio from Plivo, runs VAD
+                stt,                        # Deepgram: audio → transcript
+                context_aggregator.user(),  # accumulates user turn, fires when turn ends
+                llm,                        # GPT-4.1-mini: text → text response
+                tts,                        # ElevenLabs: text → audio frames
+                AudioDebugLogger(),         # logs STT/LLM/TTS events for debugging
+                transport.output(),         # μ-law-encodes audio, sends back to Plivo
+                context_aggregator.assistant(),
+            ]
+        )
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, websocket):
-        logger.info("[Plivo] WebSocket disconnected — cancelling pipeline")
-        await task.cancel()
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(allow_interruptions=True),
+            idle_timeout_secs=300,
+        )
 
-    runner = PipelineRunner()
-    await runner.run(task)
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, websocket):
+            logger.info("[Plivo] WebSocket connected — queuing greeting")
+            await task.queue_frames([
+                TextFrame("Hello! I'm your phone assistant. How can I help you today?")
+            ])
+
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, websocket):
+            logger.info("[Plivo] WebSocket disconnected — cancelling pipeline")
+            await task.cancel()
+
+        runner = PipelineRunner()
+        await runner.run(task)
