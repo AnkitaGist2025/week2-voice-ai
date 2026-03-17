@@ -23,6 +23,8 @@ Run
   uvicorn server:app --host 0.0.0.0 --port 5000
 """
 
+import audioop
+import base64
 import json
 import os
 from urllib.parse import urlparse
@@ -52,6 +54,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.services.openai.tts import OpenAITTSService
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
@@ -110,6 +113,7 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
             auth_token=os.getenv("PLIVO_AUTH_TOKEN"),
         )
         self._stream_initialized = False
+        self._ratecv_state = None  # audioop.ratecv conversion state
 
     async def deserialize(self, data: str | bytes):
         try:
@@ -135,18 +139,30 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
 
     async def serialize(self, frame):
         from pipecat.frames.frames import AudioRawFrame
-        if isinstance(frame, AudioRawFrame):
-            logger.info(
-                f"[SER ] encoding audio — {len(frame.audio)} PCM bytes "
-                f"@ {frame.sample_rate}Hz → 8kHz μ-law"
-            )
-        result = await super().serialize(frame)
-        if isinstance(frame, AudioRawFrame):
-            if result is None:
-                logger.warning("[SER ] pcm_to_ulaw returned None — frame dropped!")
-            else:
-                logger.info(f"[SER ] encoded OK — {len(result)} JSON bytes queued for Plivo")
-        return result
+        if not isinstance(frame, AudioRawFrame):
+            return await super().serialize(frame)
+
+        # Use audioop.ratecv which always produces output and maintains state
+        # between calls — unlike the streaming resampler which can return empty
+        # bytes when the chunk doesn't align with its internal buffer.
+        resampled, self._ratecv_state = audioop.ratecv(
+            frame.audio, 2, 1, frame.sample_rate, 8000, self._ratecv_state
+        )
+        if not resampled:
+            return None
+
+        ulaw_bytes = audioop.lin2ulaw(resampled, 2)
+        payload = base64.b64encode(ulaw_bytes).decode("utf-8")
+        message = {
+            "event": "playAudio",
+            "media": {
+                "contentType": "audio/x-mulaw",
+                "sampleRate": 8000,
+                "payload": payload,
+            },
+            "streamId": self._stream_id,
+        }
+        return json.dumps(message)
 
 
 # ── Audio debug logger ────────────────────────────────────────────────────────
@@ -241,18 +257,32 @@ async def websocket_endpoint(websocket: WebSocket):
         model="gpt-4.1-mini",
     )
 
-    tts = OpenAITTSService(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        voice="alloy",
-    )
+    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
+    if elevenlabs_key:
+        logger.info("[TTS ] Using ElevenLabs TTS")
+        tts = ElevenLabsTTSService(
+            api_key=elevenlabs_key,
+            settings=ElevenLabsTTSSettings(
+                voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
+                model="eleven_turbo_v2_5",
+            ),
+        )
+    else:
+        logger.info("[TTS ] Using OpenAI TTS (no ELEVENLABS_API_KEY set)")
+        tts = OpenAITTSService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            model="tts-1",   # tts-1 has lower latency than tts-1-hd
+            voice="nova",    # nova sounds more natural/conversational than alloy
+        )
 
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a friendly phone assistant. "
-                "Keep every reply to 1–2 sentences — your words are spoken aloud. "
-                "Avoid markdown, bullet points, or any special characters."
+                "Keep every reply to 1 sentence max — your words are spoken aloud. "
+                "Be direct and conversational. "
+                "Never use markdown, bullet points, numbers, or special characters."
             ),
         }
     ]
