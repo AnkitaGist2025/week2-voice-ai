@@ -56,7 +56,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService, ElevenLabsHttpTTSSettings
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
 
 load_dotenv()
@@ -259,10 +259,9 @@ async def websocket_endpoint(websocket: WebSocket):
             model="gpt-4.1-mini",
         )
 
-        tts = ElevenLabsHttpTTSService(
+        tts = ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
-            aiohttp_session=aiohttp_session,
-            settings=ElevenLabsHttpTTSSettings(
+            settings=ElevenLabsTTSSettings(
                 voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
                 model="eleven_turbo_v2_5",
             ),
