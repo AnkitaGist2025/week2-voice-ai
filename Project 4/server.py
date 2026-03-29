@@ -23,6 +23,7 @@ Run
   uvicorn server:app --host 0.0.0.0 --port 5000
 """
 
+import asyncio
 import audioop
 import base64
 import json
@@ -39,6 +40,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
+    ErrorFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     TextFrame,
@@ -216,6 +218,78 @@ class AudioDebugLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# ── Farewell detector ─────────────────────────────────────────────────────────
+
+_FAREWELL_KEYWORDS = {"bye", "goodbye", "good bye", "thank you", "thanks", "that's all", "that is all"}
+
+class FarewellDetector(FrameProcessor):
+    """Intercepts farewell transcriptions, speaks a closing message, then ends the call.
+
+    Placement: between stt and context_aggregator.user() so that farewell
+    transcriptions are absorbed before the LLM sees them.  The closing TextFrame
+    is injected via task.queue_frames() which routes directly to TTS, bypassing
+    the LLM.  The pipeline is cancelled after a short delay to let TTS finish.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._task_ref = None
+        self._farewell_sent = False
+
+    def set_task(self, task):
+        self._task_ref = task
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and not self._farewell_sent:
+            text_lower = frame.text.lower()
+            if any(kw in text_lower for kw in _FAREWELL_KEYWORDS):
+                self._farewell_sent = True
+                logger.info(f"[Farewell] detected in: '{frame.text}'")
+                await self._task_ref.queue_frames([
+                    TextFrame("Thank you for calling, have a great day!")
+                ])
+                # Give TTS ~3 s to finish speaking before tearing down the pipeline.
+                asyncio.create_task(self._cancel_after_delay(3.0))
+                return  # absorb — don't forward to LLM
+
+        await self.push_frame(frame, direction)
+
+    async def _cancel_after_delay(self, delay: float):
+        await asyncio.sleep(delay)
+        if self._task_ref:
+            await self._task_ref.cancel()
+
+
+# ── STT error handler ─────────────────────────────────────────────────────────
+
+class STTErrorHandler(FrameProcessor):
+    """Catches ErrorFrames from Deepgram STT and speaks a polite fallback.
+
+    Placement: immediately after stt so STT errors are handled before
+    they propagate and potentially crash downstream processors.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._task_ref = None
+
+    def set_task(self, task):
+        self._task_ref = task
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, ErrorFrame):
+            logger.warning(f"[STT ] error — {frame.error}")
+            if self._task_ref:
+                await self._task_ref.queue_frames([
+                    TextFrame("I'm having trouble hearing you, could you repeat that?")
+                ])
+            return  # absorb the ErrorFrame so it doesn't crash the pipeline
+
+        await self.push_frame(frame, direction)
 
 
 # ── WebSocket endpoint + Pipecat pipeline ────────────────────────────────────
@@ -282,11 +356,16 @@ async def websocket_endpoint(websocket: WebSocket):
         context = OpenAILLMContext(messages=messages)
         context_aggregator = LLMContextAggregatorPair(context)
 
+        farewell_detector = FarewellDetector()
+        stt_error_handler = STTErrorHandler()
+
         # Pipeline: audio in → speech-to-text → LLM → text-to-speech → audio out
         pipeline = Pipeline(
             [
                 transport.input(),          # receives μ-law audio from Plivo, runs VAD
                 stt,                        # Deepgram: audio → transcript
+                stt_error_handler,          # speaks fallback if STT fails, absorbs ErrorFrame
+                farewell_detector,          # intercepts goodbye/thanks, speaks farewell, ends call
                 context_aggregator.user(),  # accumulates user turn, fires when turn ends
                 llm,                        # GPT-4.1-mini: text → text response
                 tts,                        # ElevenLabs: text → audio frames
@@ -302,11 +381,14 @@ async def websocket_endpoint(websocket: WebSocket):
             idle_timeout_secs=300,
         )
 
+        farewell_detector.set_task(task)
+        stt_error_handler.set_task(task)
+
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, websocket):
             logger.info("[Plivo] WebSocket connected — queuing greeting")
             await task.queue_frames([
-                TextFrame("Hello! I'm your phone assistant. How can I help you today?")
+                TextFrame("Hello, thank you for calling. How can I help you today?")
             ])
 
         @transport.event_handler("on_client_disconnected")
