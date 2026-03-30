@@ -219,23 +219,61 @@ class AudioDebugLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# ── Farewell detector ─────────────────────────────────────────────────────────
+# ── Farewell handling ─────────────────────────────────────────────────────────
 
 _FAREWELL_KEYWORDS = {"bye", "goodbye", "good bye", "thank you", "thanks", "that's all", "that is all"}
 
-class FarewellDetector(FrameProcessor):
-    """Intercepts farewell transcriptions, speaks a closing message, then ends the call.
 
-    Placement: between stt and context_aggregator.user() so that farewell
-    transcriptions are absorbed before the LLM sees them.  The closing TextFrame
-    is injected via task.queue_frames() which routes directly to TTS, bypassing
-    the LLM.  The pipeline is cancelled after a short delay to let TTS finish.
+class _FarewellState:
+    """Shared flag between FarewellDetector (input side) and FarewellShutdown (output side)."""
+    def __init__(self):
+        self.farewell_sent = False
+        self.tts_started = False  # True once TTSStartedFrame fires after farewell
+
+
+class FarewellDetector(FrameProcessor):
+    """Intercepts farewell transcriptions and replaces them with an LLM instruction.
+
+    Placement: between stt and context_aggregator.user().  When the caller says
+    goodbye the original TranscriptionFrame is replaced with a directive so the
+    normal LLM → TTS path produces the farewell audio.  No task reference needed
+    here — shutdown is handled downstream by FarewellShutdown.
     """
 
-    def __init__(self):
+    def __init__(self, state: _FarewellState):
         super().__init__()
+        self._state = state
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and not self._state.farewell_sent:
+            text_lower = frame.text.lower()
+            if any(kw in text_lower for kw in _FAREWELL_KEYWORDS):
+                self._state.farewell_sent = True
+                logger.info(f"[Farewell] detected: '{frame.text}' — injecting LLM instruction")
+                # Replace the caller's words with an instruction; let LLM → TTS handle it.
+                frame = TranscriptionFrame(
+                    text="The caller said goodbye. Respond with a warm farewell and nothing else.",
+                    user_id=frame.user_id,
+                    timestamp=frame.timestamp,
+                )
+
+        await self.push_frame(frame, direction)
+
+
+class FarewellShutdown(FrameProcessor):
+    """Ends the pipeline once the farewell TTS synthesis is fully complete.
+
+    Placement: after tts, before transport.output().  Watches for TTSStartedFrame
+    (to confirm the farewell TTS has begun) and TTSStoppedFrame (to confirm all
+    audio chunks have been pushed to the transport) before queuing EndFrame.
+    """
+
+    def __init__(self, state: _FarewellState):
+        super().__init__()
+        self._state = state
         self._task_ref = None
-        self._farewell_sent = False
 
     def set_task(self, task):
         self._task_ref = task
@@ -243,26 +281,20 @@ class FarewellDetector(FrameProcessor):
     async def process_frame(self, frame, direction):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TranscriptionFrame) and not self._farewell_sent:
-            text_lower = frame.text.lower()
-            if any(kw in text_lower for kw in _FAREWELL_KEYWORDS):
-                self._farewell_sent = True
-                logger.info(f"[Farewell] detected in: '{frame.text}'")
-                await self._task_ref.queue_frames([
-                    TextFrame("Thank you for calling, have a great day!")
-                ])
-                # Wait for ElevenLabs to stream audio back through Plivo before
-                # shutting down.  EndFrame drains the pipeline gracefully (unlike
-                # task.cancel() which tears it down immediately).
-                asyncio.create_task(self._end_after_delay(6.0))
-                return  # absorb — don't forward to LLM
+        if self._state.farewell_sent:
+            if isinstance(frame, TTSStartedFrame):
+                self._state.tts_started = True
+
+            elif isinstance(frame, TTSStoppedFrame) and self._state.tts_started:
+                # Push the stop frame so transport.output() can cleanly finish,
+                # then signal graceful pipeline shutdown.
+                await self.push_frame(frame, direction)
+                logger.info("[Farewell] TTS done — queuing EndFrame to close call")
+                if self._task_ref:
+                    await self._task_ref.queue_frames([EndFrame()])
+                return  # already pushed above
 
         await self.push_frame(frame, direction)
-
-    async def _end_after_delay(self, delay: float):
-        await asyncio.sleep(delay)
-        if self._task_ref:
-            await self._task_ref.queue_frames([EndFrame()])
 
 
 # ── STT error handler ─────────────────────────────────────────────────────────
@@ -359,7 +391,9 @@ async def websocket_endpoint(websocket: WebSocket):
         context = OpenAILLMContext(messages=messages)
         context_aggregator = LLMContextAggregatorPair(context)
 
-        farewell_detector = FarewellDetector()
+        farewell_state = _FarewellState()
+        farewell_detector = FarewellDetector(farewell_state)
+        farewell_shutdown = FarewellShutdown(farewell_state)
         stt_error_handler = STTErrorHandler()
 
         # Pipeline: audio in → speech-to-text → LLM → text-to-speech → audio out
@@ -368,10 +402,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 transport.input(),          # receives μ-law audio from Plivo, runs VAD
                 stt,                        # Deepgram: audio → transcript
                 stt_error_handler,          # speaks fallback if STT fails, absorbs ErrorFrame
-                farewell_detector,          # intercepts goodbye/thanks, speaks farewell, ends call
+                farewell_detector,          # replaces goodbye transcript with LLM instruction
                 context_aggregator.user(),  # accumulates user turn, fires when turn ends
                 llm,                        # GPT-4.1-mini: text → text response
                 tts,                        # ElevenLabs: text → audio frames
+                farewell_shutdown,          # ends call after farewell TTS synthesis completes
                 AudioDebugLogger(),         # logs STT/LLM/TTS events for debugging
                 transport.output(),         # μ-law-encodes audio, sends back to Plivo
                 context_aggregator.assistant(),
@@ -384,7 +419,7 @@ async def websocket_endpoint(websocket: WebSocket):
             idle_timeout_secs=300,
         )
 
-        farewell_detector.set_task(task)
+        farewell_shutdown.set_task(task)
         stt_error_handler.set_task(task)
 
         @transport.event_handler("on_client_connected")
