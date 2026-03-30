@@ -40,6 +40,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
+    EndFrame,
     ErrorFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -250,16 +251,18 @@ class FarewellDetector(FrameProcessor):
                 await self._task_ref.queue_frames([
                     TextFrame("Thank you for calling, have a great day!")
                 ])
-                # Give TTS ~3 s to finish speaking before tearing down the pipeline.
-                asyncio.create_task(self._cancel_after_delay(3.0))
+                # Wait for ElevenLabs to stream audio back through Plivo before
+                # shutting down.  EndFrame drains the pipeline gracefully (unlike
+                # task.cancel() which tears it down immediately).
+                asyncio.create_task(self._end_after_delay(6.0))
                 return  # absorb — don't forward to LLM
 
         await self.push_frame(frame, direction)
 
-    async def _cancel_after_delay(self, delay: float):
+    async def _end_after_delay(self, delay: float):
         await asyncio.sleep(delay)
         if self._task_ref:
-            await self._task_ref.cancel()
+            await self._task_ref.queue_frames([EndFrame()])
 
 
 # ── STT error handler ─────────────────────────────────────────────────────────
