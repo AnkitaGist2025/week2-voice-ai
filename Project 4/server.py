@@ -134,6 +134,7 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
             self._call_id = start.get("callId")
             self.caller_number = start.get("from", "unknown")
             self._stream_initialized = True
+            logger.info(f"[Plivo] start event payload: {json.dumps(start)}")
             logger.info(
                 f"[Plivo] stream started — stream_id={self._stream_id}  "
                 f"call_id={self._call_id}  from={self.caller_number}"
@@ -444,7 +445,7 @@ async def websocket_endpoint(websocket: WebSocket):
         tts = ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             settings=ElevenLabsTTSSettings(
-                voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
+                voice_id=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
                 model="eleven_turbo_v2_5",
             ),
         )
