@@ -120,7 +120,7 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
         )
         self._stream_initialized = False
         self._ratecv_state = None  # audioop.ratecv conversion state
-        self.caller_number = "unknown"
+        self.call_id: str | None = None
 
     async def deserialize(self, data: str | bytes):
         try:
@@ -132,12 +132,10 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
             start = message.get("start", {})
             self._stream_id = start.get("streamId", "")
             self._call_id = start.get("callId")
-            self.caller_number = start.get("from", "unknown")
+            self.call_id = self._call_id
             self._stream_initialized = True
-            logger.info(f"[Plivo] start event payload: {json.dumps(start)}")
             logger.info(
-                f"[Plivo] stream started — stream_id={self._stream_id}  "
-                f"call_id={self._call_id}  from={self.caller_number}"
+                f"[Plivo] stream started — stream_id={self._stream_id}  call_id={self.call_id}"
             )
             return None  # 'start' carries no audio
 
@@ -355,14 +353,37 @@ class TranscriptCollector(FrameProcessor):
 
 # ── Call logging ──────────────────────────────────────────────────────────────
 
+async def _fetch_caller_number(call_id: str) -> str:
+    """Look up the caller's number via the Plivo REST API using the call UUID."""
+    auth_id = os.getenv("PLIVO_AUTH_ID", "")
+    auth_token = os.getenv("PLIVO_AUTH_TOKEN", "")
+    if not auth_id or not auth_token or not call_id:
+        return "unknown"
+    url = f"https://api.plivo.com/v1/Account/{auth_id}/Call/{call_id}/"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, auth=aiohttp.BasicAuth(auth_id, auth_token)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    number = data.get("from_number", "unknown")
+                    logger.info(f"[Plivo API] caller number: {number}")
+                    return number
+                logger.warning(f"[Plivo API] call lookup returned HTTP {resp.status}")
+    except Exception as exc:
+        logger.error(f"[Plivo API] failed to fetch caller number: {exc}")
+    return "unknown"
+
+
 async def _log_call_to_db(
-    caller_number: str,
+    call_id: str | None,
     duration_secs: int,
     transcript: str,
     timestamp: datetime,
 ) -> None:
-    """Insert a call record into PostgreSQL.  Called as a background task so it
-    never blocks the WebSocket handler or affects the next incoming call."""
+    """Fetch caller number from Plivo, then insert a call record into PostgreSQL.
+    Called as a background task so it never blocks the WebSocket handler."""
+    caller_number = await _fetch_caller_number(call_id or "")
+
     raw_url = os.getenv("DATABASE_URL", "")
     if not raw_url:
         logger.warning("[DB] DATABASE_URL not set — skipping call log")
@@ -376,11 +397,11 @@ async def _log_call_to_db(
         try:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS call_logs (
-                    id                   SERIAL PRIMARY KEY,
-                    caller_number        TEXT,
+                    id                    SERIAL PRIMARY KEY,
+                    caller_number         TEXT,
                     call_duration_seconds INTEGER,
-                    full_transcript      TEXT,
-                    timestamp            TIMESTAMPTZ DEFAULT NOW()
+                    full_transcript       TEXT,
+                    timestamp             TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
             await conn.execute(
@@ -519,7 +540,7 @@ async def websocket_endpoint(websocket: WebSocket):
         full_transcript = " ".join(transcript_collector.lines)
         asyncio.create_task(
             _log_call_to_db(
-                caller_number=serializer.caller_number,
+                call_id=serializer.call_id,
                 duration_secs=duration_secs,
                 transcript=full_transcript,
                 timestamp=call_end,
