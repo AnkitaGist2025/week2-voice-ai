@@ -445,7 +445,7 @@ async def websocket_endpoint(websocket: WebSocket):
         tts = ElevenLabsTTSService(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             settings=ElevenLabsTTSSettings(
-                voice_id=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
+                voice=os.getenv("ELEVENLABS_VOICE_ID", "TX3LPaxmHKxFdv7VOQHJ"),
                 model="eleven_turbo_v2_5",
             ),
         )
