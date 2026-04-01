@@ -28,9 +28,11 @@ import audioop
 import base64
 import json
 import os
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import aiohttp
+import asyncpg
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -118,6 +120,7 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
         )
         self._stream_initialized = False
         self._ratecv_state = None  # audioop.ratecv conversion state
+        self.caller_number = "unknown"
 
     async def deserialize(self, data: str | bytes):
         try:
@@ -129,9 +132,11 @@ class DynamicPlivoSerializer(PlivoFrameSerializer):
             start = message.get("start", {})
             self._stream_id = start.get("streamId", "")
             self._call_id = start.get("callId")
+            self.caller_number = start.get("from", "unknown")
             self._stream_initialized = True
             logger.info(
-                f"[Plivo] stream started — stream_id={self._stream_id}  call_id={self._call_id}"
+                f"[Plivo] stream started — stream_id={self._stream_id}  "
+                f"call_id={self._call_id}  from={self.caller_number}"
             )
             return None  # 'start' carries no audio
 
@@ -327,6 +332,72 @@ class STTErrorHandler(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# ── Transcript collector ──────────────────────────────────────────────────────
+
+class TranscriptCollector(FrameProcessor):
+    """Accumulates all STT transcription text for post-call logging.
+
+    Placement: after stt_error_handler, before farewell_detector, so it
+    records what the caller actually said (not the injected LLM instruction).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.lines: list[str] = []
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            self.lines.append(frame.text.strip())
+        await self.push_frame(frame, direction)
+
+
+# ── Call logging ──────────────────────────────────────────────────────────────
+
+async def _log_call_to_db(
+    caller_number: str,
+    duration_secs: int,
+    transcript: str,
+    timestamp: datetime,
+) -> None:
+    """Insert a call record into PostgreSQL.  Called as a background task so it
+    never blocks the WebSocket handler or affects the next incoming call."""
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url:
+        logger.warning("[DB] DATABASE_URL not set — skipping call log")
+        return
+
+    # Railway exposes postgres:// but asyncpg requires postgresql://
+    db_url = raw_url.replace("postgres://", "postgresql://", 1)
+
+    try:
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS call_logs (
+                    id                   SERIAL PRIMARY KEY,
+                    caller_number        TEXT,
+                    call_duration_seconds INTEGER,
+                    full_transcript      TEXT,
+                    timestamp            TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO call_logs "
+                "(caller_number, call_duration_seconds, full_transcript, timestamp) "
+                "VALUES ($1, $2, $3, $4)",
+                caller_number, duration_secs, transcript, timestamp,
+            )
+            logger.info(
+                f"[DB] call logged — caller={caller_number}  "
+                f"duration={duration_secs}s  transcript_chars={len(transcript)}"
+            )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.error(f"[DB] failed to log call: {exc}")
+
+
 # ── WebSocket endpoint + Pipecat pipeline ────────────────────────────────────
 
 @app.websocket("/ws")
@@ -338,12 +409,14 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     await websocket.accept()
     logger.info(f"[Plivo] WebSocket connected from {websocket.client}")
+    call_start = datetime.now(timezone.utc)
 
     async with aiohttp.ClientSession() as aiohttp_session:
+        serializer = DynamicPlivoSerializer()
         transport = FastAPIWebsocketTransport(
             websocket=websocket,
             params=FastAPIWebsocketParams(
-                serializer=DynamicPlivoSerializer(),
+                serializer=serializer,
                 audio_in_enabled=True,
                 audio_out_enabled=True,
                 add_wav_header=False,
@@ -395,6 +468,7 @@ async def websocket_endpoint(websocket: WebSocket):
         farewell_detector = FarewellDetector(farewell_state)
         farewell_shutdown = FarewellShutdown(farewell_state)
         stt_error_handler = STTErrorHandler()
+        transcript_collector = TranscriptCollector()
 
         # Pipeline: audio in → speech-to-text → LLM → text-to-speech → audio out
         pipeline = Pipeline(
@@ -402,6 +476,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 transport.input(),          # receives μ-law audio from Plivo, runs VAD
                 stt,                        # Deepgram: audio → transcript
                 stt_error_handler,          # speaks fallback if STT fails, absorbs ErrorFrame
+                transcript_collector,       # records what the caller said for post-call logging
                 farewell_detector,          # replaces goodbye transcript with LLM instruction
                 context_aggregator.user(),  # accumulates user turn, fires when turn ends
                 llm,                        # GPT-4.1-mini: text → text response
@@ -436,3 +511,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
         runner = PipelineRunner()
         await runner.run(task)
+
+        # ── Post-call logging (non-blocking) ──────────────────────────────────
+        call_end = datetime.now(timezone.utc)
+        duration_secs = int((call_end - call_start).total_seconds())
+        full_transcript = " ".join(transcript_collector.lines)
+        asyncio.create_task(
+            _log_call_to_db(
+                caller_number=serializer.caller_number,
+                duration_secs=duration_secs,
+                transcript=full_transcript,
+                timestamp=call_end,
+            )
+        )

@@ -14,3 +14,6 @@ aiohttp
 
 # .env loading
 python-dotenv
+
+# Async PostgreSQL driver — used for post-call logging to Railway Postgres
+asyncpg
